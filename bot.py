@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from aiogram import Bot, Dispatcher, F, Router
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -381,8 +381,7 @@ async def _do_submit(message: Message, state: FSMContext):
     await state.set_state(SubmitForm.item_name)
     await message.answer(
         "📦 <b>开始投稿</b>\n\n"
-        "第 1 步 / 共 7 步\n"
-        "请输入<b>物品名称</b>\n"
+        "第 1 步 / 共 8 步\n请输入<b>物品名称</b>\n"
         "💡 例：iPhone 14 Pro 128GB 深紫色",
         parse_mode="HTML",
         reply_markup=ReplyKeyboardRemove()
@@ -414,12 +413,8 @@ async def step_item_name(message: Message, state: FSMContext):
 # 步骤 2：分类选择（callback）
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("cat:"))
+@router.callback_query(F.data.startswith("cat:"), StateFilter(SubmitForm.item_category))
 async def step_category_selected(callback: CallbackQuery, state: FSMContext):
-    current = await state.get_state()
-    if current != SubmitForm.item_category:
-        await callback.answer()
-        return
 
     category = callback.data[4:]  # 去掉 "cat:" 前缀
     await state.update_data(item_category=category)
@@ -430,7 +425,7 @@ async def step_category_selected(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await callback.message.answer(
-        "第 3 步 / 共 7 步\n请输入<b>物品描述</b>\n"
+        "第 3 步 / 共 8 步\n请输入<b>物品描述</b>\n"
         "💡 例：9成新，无划痕，原装配件齐全",
         parse_mode="HTML"
     )
@@ -447,7 +442,7 @@ async def step_item_desc(message: Message, state: FSMContext):
     await state.update_data(item_desc=(message.text or "").strip())
     await state.set_state(SubmitForm.item_price)
     await message.answer(
-        "第 4 步 / 共 7 步\n请输入<b>价格</b>（RM）\n"
+        "第 4 步 / 共 8 步\n请输入<b>价格</b>（RM）\n"
         "💡 例：350　或　面议",
         parse_mode="HTML"
     )
@@ -463,7 +458,7 @@ async def step_item_price(message: Message, state: FSMContext):
     await state.update_data(item_price=(message.text or "").strip())
     await state.set_state(SubmitForm.item_price_type)
     await message.answer(
-        "第 5 步 / 共 7 步\n请选择<b>议价类型</b>：",
+        "第 5 步 / 共 8 步\n请选择<b>议价类型</b>：",
         parse_mode="HTML",
         reply_markup=price_type_keyboard()
     )
@@ -472,12 +467,8 @@ async def step_item_price(message: Message, state: FSMContext):
 # 步骤 5：议价类型（callback）
 # ─────────────────────────────────────────────────────────────────────────────
 
-@router.callback_query(F.data.startswith("pt:"))
+@router.callback_query(F.data.startswith("pt:"), StateFilter(SubmitForm.item_price_type))
 async def step_price_type_selected(callback: CallbackQuery, state: FSMContext):
-    current = await state.get_state()
-    if current != SubmitForm.item_price_type:
-        await callback.answer()
-        return
 
     pt_key = callback.data[3:]  # 去掉 "pt:" 前缀
     pt_label = PRICE_TYPES.get(pt_key, "")
@@ -489,7 +480,7 @@ async def step_price_type_selected(callback: CallbackQuery, state: FSMContext):
         parse_mode="HTML"
     )
     await callback.message.answer(
-        "第 6 步 / 共 7 步\n请输入<b>所在地区</b>\n"
+        "第 6 步 / 共 8 步\n请输入<b>所在地区</b>\n"
         "💡 例：Subang Jaya, Selangor",
         parse_mode="HTML"
     )
@@ -506,7 +497,7 @@ async def step_item_area(message: Message, state: FSMContext):
     await state.update_data(item_area=(message.text or "").strip())
     await state.set_state(SubmitForm.contact)
     await message.answer(
-        "第 7 步（最后）/ 共 7 步\n请输入<b>联系方式</b>\n"
+        "第 7 步（最后）/ 共 8 步\n请输入<b>联系方式</b>\n"
         "💡 例：WA: 601XXXXXXXX 或 @telegram用户名",
         parse_mode="HTML"
     )
@@ -522,7 +513,7 @@ async def step_contact(message: Message, state: FSMContext):
     await state.update_data(contact=(message.text or "").strip(), media=[])
     await state.set_state(SubmitForm.media)
     await message.answer(
-        "📸 <b>最后一步：上传图片或视频</b>（最多 10 个）\n\n"
+        "第 8 步 / 共 8 步\n📸 <b>上传图片或视频</b>（最多 10 个）\n\n"
         "⚠️ 请<b>逐个</b>发送，不要用相册合并发送\n"
         "📌 上传完毕后点击「✅ 提交投稿」",
         parse_mode="HTML",
