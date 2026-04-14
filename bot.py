@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import time
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command, StateFilter
@@ -95,6 +96,11 @@ CATEGORY_KEYWORDS = {
         "积木", "lego", "乐高", "健身", "球", "运动器材", "吉他", "乐器"
     ],
 }
+
+def category_to_hashtag(category):
+    """把分类转成 Telegram hashtag，例：'📱 手机数码' → '#手机数码'"""
+    text = re.sub(r'[^\w\u4e00-\u9fff]', '', category, flags=re.UNICODE)
+    return '#' + text if text else ''
 
 def detect_category(text):
     """根据物品名称关键词预判分类，返回建议分类或 None"""
@@ -263,17 +269,19 @@ def format_channel_text(data, user_id, username, full_name):
     number     = data.get("number", "????")
     category   = data.get("item_category", "")
     price_type = PRICE_TYPES.get(data.get("item_price_type", "fixed"), "")
+    tag        = category_to_hashtag(category)
     if username:
         user_link = '<a href="https://t.me/' + username + '">' + full_name + "</a>"
     else:
         user_link = '<a href="tg://user?id=' + str(user_id) + '">' + full_name + "</a>"
     return (
-        "🏷️ <b>#" + str(number) + " | " + data["item_name"] + "</b>　" + category + "\n\n"
+        "🏷️ <b>#" + str(number) + " | " + data["item_name"] + "</b>\n\n"
         "📝 " + data["item_desc"] + "\n\n"
         "💰 <b>价格：</b>RM " + data["item_price"] + "　" + price_type + "\n"
         "📍 <b>地区：</b>" + data["item_area"] + "\n"
         "📞 <b>联系：</b>" + data["contact"] + "\n\n"
-        "👤 投稿人：" + user_link
+        "👤 投稿人：" + user_link + "\n\n"
+        + tag + " #二手 #大马二手"
     )
 
 def build_media_group(media_list, caption, parse_mode="HTML"):
