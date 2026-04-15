@@ -1,7 +1,7 @@
 import asyncio
 import logging
-import os
 import re
+import sqlite3
 import time
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import CommandStart, Command, StateFilter
@@ -12,6 +12,10 @@ from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
     InputMediaPhoto, InputMediaVideo, ReplyKeyboardMarkup, KeyboardButton,
     ReplyKeyboardRemove
+)
+from config import (
+    BOT_TOKEN, ADMIN_ID, CHANNEL_ID, CHANNEL_NAME,
+    GROUP_ID, GROUP_LINK, COUNTER_START
 )
 
 logging.basicConfig(
@@ -24,33 +28,165 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── 配置 ──────────────────────────────────────────────────────────────────────
-BOT_TOKEN    = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-ADMIN_ID     = int(os.getenv("ADMIN_ID", "0"))
-CHANNEL_ID   = os.getenv("CHANNEL_ID", "@your_channel")
-CHANNEL_NAME = "malaixiyaershouqun"
-GROUP_ID     = "@damajiaoliu"
-GROUP_LINK   = "https://t.me/damajiaoliu"
+# ════════════════════════════════════════════════════════════════════════════
+# SQLite 数据库
+# ════════════════════════════════════════════════════════════════════════════
 
-# ── 投稿编号 ──────────────────────────────────────────────────────────────────
-submission_counter = 1009527
+DB_FILE = "secondhand.db"
+
+def get_db():
+    conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def db_init():
+    conn = get_db()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS counter (
+            key   TEXT PRIMARY KEY,
+            value INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS ads (
+            id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            text   TEXT NOT NULL,
+            url    TEXT NOT NULL,
+            expire REAL
+        );
+        CREATE TABLE IF NOT EXISTS sold_posts (
+            number     INTEGER PRIMARY KEY,
+            btn_msg_id INTEGER NOT NULL,
+            user_id    INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS votes (
+            msg_id     INTEGER PRIMARY KEY,
+            up_count   INTEGER DEFAULT 0,
+            down_count INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS vote_users (
+            msg_id  INTEGER NOT NULL,
+            user_id INTEGER NOT NULL,
+            PRIMARY KEY (msg_id, user_id)
+        );
+    """)
+    conn.commit()
+    conn.close()
+
+# ── 计数器 ────────────────────────────────────────────────────────────────────
+def db_load_counter():
+    conn = get_db()
+    row = conn.execute("SELECT value FROM counter WHERE key='submission'").fetchone()
+    conn.close()
+    return row["value"] if row else COUNTER_START
+
+def db_save_counter(value):
+    conn = get_db()
+    conn.execute("INSERT OR REPLACE INTO counter (key, value) VALUES ('submission', ?)", (value,))
+    conn.commit()
+    conn.close()
+
+# ── 广告 ──────────────────────────────────────────────────────────────────────
+def db_load_ads():
+    conn = get_db()
+    rows = conn.execute("SELECT text, url, expire FROM ads ORDER BY id").fetchall()
+    conn.close()
+    return [{"text": r["text"], "url": r["url"], "expire": r["expire"]} for r in rows]
+
+def db_add_ad(text, url, expire):
+    conn = get_db()
+    conn.execute("INSERT INTO ads (text, url, expire) VALUES (?, ?, ?)", (text, url, expire))
+    conn.commit()
+    conn.close()
+
+def db_delete_ad_by_index(idx):
+    conn = get_db()
+    rows = conn.execute("SELECT id FROM ads ORDER BY id").fetchall()
+    if 0 <= idx < len(rows):
+        conn.execute("DELETE FROM ads WHERE id=?", (rows[idx]["id"],))
+        conn.commit()
+    conn.close()
+
+def db_clean_expired_ads():
+    conn = get_db()
+    deleted = conn.execute(
+        "DELETE FROM ads WHERE expire IS NOT NULL AND expire <= ?", (time.time(),)
+    ).rowcount
+    conn.commit()
+    conn.close()
+    return deleted
+
+# ── 已售出 ────────────────────────────────────────────────────────────────────
+def db_load_sold():
+    conn = get_db()
+    rows = conn.execute("SELECT number, btn_msg_id, user_id FROM sold_posts").fetchall()
+    conn.close()
+    return {r["number"]: {"btn_msg_id": r["btn_msg_id"], "user_id": r["user_id"]} for r in rows}
+
+def db_add_sold(number, btn_msg_id, user_id):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO sold_posts (number, btn_msg_id, user_id) VALUES (?, ?, ?)",
+        (number, btn_msg_id, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+def db_delete_sold(number):
+    conn = get_db()
+    conn.execute("DELETE FROM sold_posts WHERE number=?", (number,))
+    conn.commit()
+    conn.close()
+
+# ── 点赞 ──────────────────────────────────────────────────────────────────────
+def db_load_votes():
+    conn = get_db()
+    vote_d = {}
+    vote_u = {}
+    for r in conn.execute("SELECT msg_id, up_count, down_count FROM votes").fetchall():
+        vote_d[r["msg_id"]] = {"up": r["up_count"], "down": r["down_count"]}
+    for r in conn.execute("SELECT msg_id, user_id FROM vote_users").fetchall():
+        vote_u.setdefault(r["msg_id"], set()).add(r["user_id"])
+    conn.close()
+    return vote_d, vote_u
+
+def db_save_vote(msg_id, up, down):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR REPLACE INTO votes (msg_id, up_count, down_count) VALUES (?, ?, ?)",
+        (msg_id, up, down)
+    )
+    conn.commit()
+    conn.close()
+
+def db_add_vote_user(msg_id, user_id):
+    conn = get_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO vote_users (msg_id, user_id) VALUES (?, ?)",
+        (msg_id, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+# ════════════════════════════════════════════════════════════════════════════
+# 启动时加载数据
+# ════════════════════════════════════════════════════════════════════════════
+
+db_init()
+
+submission_counter          = db_load_counter()
+ads                         = db_load_ads()
+sold_posts                  = db_load_sold()
+vote_data, vote_users       = db_load_votes()
 
 def next_submission_number():
     global submission_counter
     submission_counter += 1
+    db_save_counter(submission_counter)
     return submission_counter
 
-# ── 点赞/点踩存储 ─────────────────────────────────────────────────────────────
-vote_data = {}
-vote_users = {}
+# ════════════════════════════════════════════════════════════════════════════
+# 分类配置
+# ════════════════════════════════════════════════════════════════════════════
 
-# ── 广告存储 ──────────────────────────────────────────────────────────────────
-ads = []
-
-# ── 已售出记录 {number: {"btn_msg_id": int, "user_id": int}} ──────────────────
-sold_posts = {}
-
-# ── 分类配置 ──────────────────────────────────────────────────────────────────
 CATEGORIES = [
     "📱 手机数码",
     "💻 电脑周边",
@@ -62,7 +198,6 @@ CATEGORIES = [
     "🔧 其他杂物",
 ]
 
-# 关键词 → 分类（用于智能预判）
 CATEGORY_KEYWORDS = {
     "📱 手机数码": [
         "手机", "iphone", "samsung", "三星", "小米", "华为", "oppo", "vivo",
@@ -97,13 +232,7 @@ CATEGORY_KEYWORDS = {
     ],
 }
 
-def category_to_hashtag(category):
-    """把分类转成 Telegram hashtag，例：'📱 手机数码' → '#手机数码'"""
-    text = re.sub(r'[^\w\u4e00-\u9fff]', '', category, flags=re.UNICODE)
-    return '#' + text if text else ''
-
 def detect_category(text):
-    """根据物品名称关键词预判分类，返回建议分类或 None"""
     text_lower = (text or "").lower()
     for category, keywords in CATEGORY_KEYWORDS.items():
         for kw in keywords:
@@ -111,20 +240,30 @@ def detect_category(text):
                 return category
     return None
 
-# ── 价格类型 ──────────────────────────────────────────────────────────────────
+def category_to_hashtag(category):
+    text = re.sub(r'[^\w\u4e00-\u9fff]', '', category, flags=re.UNICODE)
+    return '#' + text if text else ''
+
+# ════════════════════════════════════════════════════════════════════════════
+# 议价类型
+# ════════════════════════════════════════════════════════════════════════════
+
 PRICE_TYPES = {
-    "fixed":      "💰 固定价格",
-    "negotiate":  "🔪 可以刀价",
-    "face":       "💬 价格面议",
+    "fixed":     "💰 固定价格",
+    "negotiate": "🔪 可以刀价",
+    "face":      "💬 价格面议",
 }
 
-# ── FSM ───────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# FSM
+# ════════════════════════════════════════════════════════════════════════════
+
 class SubmitForm(StatesGroup):
     item_name       = State()
-    item_category   = State()   # 新增：分类选择
+    item_category   = State()
     item_desc       = State()
     item_price      = State()
-    item_price_type = State()   # 新增：议价类型
+    item_price_type = State()
     item_area       = State()
     contact         = State()
     media           = State()
@@ -135,13 +274,19 @@ class RejectReason(StatesGroup):
 class AddAd(StatesGroup):
     waiting_input = State()
 
-# ── 临时存储 ──────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# 临时存储（待审、拒绝上下文）
+# ════════════════════════════════════════════════════════════════════════════
+
 pending_submissions = {}
-reject_context = {}
+reject_context      = {}
 
 router = Router()
 
-# ── 触发词 ────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# 触发词
+# ════════════════════════════════════════════════════════════════════════════
+
 def is_submit_trigger(text):
     return (text or "").strip() in ["📦 开始投稿", "/submit", "投稿", "开始投稿"]
 
@@ -160,7 +305,10 @@ def is_delad_trigger(text):
 def is_listad_trigger(text):
     return (text or "").strip() in ["看广告", "/listad", "广告列表"]
 
-# ── 键盘 ──────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# 键盘
+# ════════════════════════════════════════════════════════════════════════════
+
 def main_keyboard():
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="📦 开始投稿"), KeyboardButton(text="❌ 取消投稿")]],
@@ -175,24 +323,18 @@ def done_keyboard():
 
 def admin_review_keyboard(submission_id):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ 审核通过", callback_data="approve:" + submission_id),
-        InlineKeyboardButton(text="❌ 审核不通过", callback_data="reject:" + submission_id),
+        InlineKeyboardButton(text="✅ 审核通过",   callback_data="approve:" + submission_id),
+        InlineKeyboardButton(text="❌ 审核不通过", callback_data="reject:"  + submission_id),
     ]])
 
 def category_keyboard(suggested=None):
-    """分类选择键盘，suggested 分类高亮显示在第一行"""
     rows = []
     remaining = [c for c in CATEGORIES if c != suggested]
-
     if suggested:
-        rows.append([
-            InlineKeyboardButton(
-                text="✅ " + suggested + "（推荐）",
-                callback_data="cat:" + suggested
-            )
-        ])
-
-    # 其余分类两列排列
+        rows.append([InlineKeyboardButton(
+            text="✅ " + suggested + "（推荐）",
+            callback_data="cat:" + suggested
+        )])
     row = []
     for cat in remaining:
         row.append(InlineKeyboardButton(text=cat, callback_data="cat:" + cat))
@@ -201,11 +343,9 @@ def category_keyboard(suggested=None):
             row = []
     if row:
         rows.append(row)
-
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def price_type_keyboard():
-    """议价类型选择"""
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="💰 固定价格", callback_data="pt:fixed"),
         InlineKeyboardButton(text="🔪 可以刀价", callback_data="pt:negotiate"),
@@ -215,29 +355,31 @@ def price_type_keyboard():
 def channel_keyboard(btn_msg_id, sold=False):
     now = time.time()
     active_ads = [ad for ad in ads if ad["expire"] is None or ad["expire"] > now]
-
     if sold:
         rows = [[InlineKeyboardButton(text="🔴 此商品已售出", callback_data="sold_notice")]]
     else:
         votes = vote_data.get(btn_msg_id, {"up": 0, "down": 0})
         rows = [[
-            InlineKeyboardButton(text="👍 " + str(votes["up"]),  callback_data="vote:up:"   + str(btn_msg_id)),
+            InlineKeyboardButton(text="👍 " + str(votes["up"]),   callback_data="vote:up:"   + str(btn_msg_id)),
             InlineKeyboardButton(text="💬 讨论一下", url=GROUP_LINK),
             InlineKeyboardButton(text="👎 " + str(votes["down"]), callback_data="vote:down:" + str(btn_msg_id)),
         ]]
-
     for ad in active_ads:
         rows.append([InlineKeyboardButton(text=ad["text"], url=ad["url"])])
-
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def group_notify_keyboard(post_msg_id):
-    url = "https://t.me/" + CHANNEL_NAME + "/" + str(post_msg_id)
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="👀 查看商品详情", url=url)
+        InlineKeyboardButton(
+            text="👀 查看商品详情",
+            url="https://t.me/" + CHANNEL_NAME + "/" + str(post_msg_id)
+        )
     ]])
 
-# ── 格式化文本 ────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# 格式化文本
+# ════════════════════════════════════════════════════════════════════════════
+
 def make_submission_id(user_id):
     return str(user_id) + "_" + str(int(time.time()))
 
@@ -245,14 +387,11 @@ def format_admin_text(data, user_id, media_list):
     number     = data.get("number", "????")
     category   = data.get("item_category", "未分类")
     price_type = PRICE_TYPES.get(data.get("item_price_type", "fixed"), "")
-    photo_count = sum(1 for m in media_list if m["type"] == "photo")
-    video_count = sum(1 for m in media_list if m["type"] == "video")
-    media_info = []
-    if photo_count:
-        media_info.append("🖼 图片 " + str(photo_count) + " 张")
-    if video_count:
-        media_info.append("🎬 视频 " + str(video_count) + " 个")
-    media_str = "、".join(media_info)
+    photos     = sum(1 for m in media_list if m["type"] == "photo")
+    videos     = sum(1 for m in media_list if m["type"] == "video")
+    media_parts = []
+    if photos: media_parts.append("🖼 图片 " + str(photos) + " 张")
+    if videos: media_parts.append("🎬 视频 " + str(videos) + " 个")
     return (
         "📬 <b>新投稿待审核 #" + str(number) + "</b>\n\n"
         "🏷️ <b>分类：</b>" + category + "\n"
@@ -261,7 +400,7 @@ def format_admin_text(data, user_id, media_list):
         "💰 <b>价格：</b>RM " + data["item_price"] + "　" + price_type + "\n"
         "📍 <b>地区：</b>" + data["item_area"] + "\n"
         "📞 <b>联系方式：</b>" + data["contact"] + "\n"
-        "📎 <b>媒体：</b>" + media_str + "\n"
+        "📎 <b>媒体：</b>" + "、".join(media_parts) + "\n"
         "👤 <b>投稿人 ID：</b><code>" + str(user_id) + "</code>"
     )
 
@@ -310,17 +449,19 @@ async def post_to_channel_with_buttons(bot, media_list, channel_text, number, it
                 caption=channel_text, parse_mode="HTML",
                 reply_markup=channel_keyboard(0)
             )
-        btn_msg_id  = sent.message_id
-        post_msg_id = btn_msg_id
+        btn_msg_id = post_msg_id = sent.message_id
         vote_data[btn_msg_id]  = {"up": 0, "down": 0}
         vote_users[btn_msg_id] = set()
+        db_save_vote(btn_msg_id, 0, 0)
         await bot.edit_message_reply_markup(
             chat_id=CHANNEL_ID, message_id=btn_msg_id,
             reply_markup=channel_keyboard(btn_msg_id)
         )
     else:
-        media_group = build_media_group(media_list, channel_text)
-        msgs = await bot.send_media_group(chat_id=CHANNEL_ID, media=media_group)
+        msgs = await bot.send_media_group(
+            chat_id=CHANNEL_ID,
+            media=build_media_group(media_list, channel_text)
+        )
         post_msg_id = msgs[0].message_id
         btn_msg = await bot.send_message(
             chat_id=CHANNEL_ID,
@@ -330,17 +471,16 @@ async def post_to_channel_with_buttons(bot, media_list, channel_text, number, it
         btn_msg_id = btn_msg.message_id
         vote_data[btn_msg_id]  = {"up": 0, "down": 0}
         vote_users[btn_msg_id] = set()
+        db_save_vote(btn_msg_id, 0, 0)
         await bot.edit_message_reply_markup(
             chat_id=CHANNEL_ID, message_id=btn_msg_id,
             reply_markup=channel_keyboard(btn_msg_id)
         )
-
     return post_msg_id, btn_msg_id
 
-
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # /start
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
@@ -353,9 +493,9 @@ async def cmd_start(message: Message, state: FSMContext):
         reply_markup=main_keyboard()
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # 取消
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message, state: FSMContext):
@@ -372,9 +512,9 @@ async def _do_cancel(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("✅ 已取消本次投稿。", reply_markup=main_keyboard())
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # 开始投稿
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(Command("submit"))
 async def cmd_submit(message: Message, state: FSMContext):
@@ -395,43 +535,34 @@ async def _do_submit(message: Message, state: FSMContext):
         reply_markup=ReplyKeyboardRemove()
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 步骤 1：物品名称 → 触发分类预判
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# 步骤 1：物品名称 → 智能预判分类
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(SubmitForm.item_name)
 async def step_item_name(message: Message, state: FSMContext):
     if is_cancel_trigger(message.text):
         await _do_cancel(message, state); return
-
     item_name = (message.text or "").strip()
     await state.update_data(item_name=item_name)
     await state.set_state(SubmitForm.item_category)
-
     suggested = detect_category(item_name)
-
-    if suggested:
-        hint = "🤖 根据物品名称，为你推荐分类 <b>" + suggested + "</b>\n点击确认或选择其他分类："
-    else:
-        hint = "📂 请选择商品分类："
-
+    hint = (
+        "🤖 根据物品名称，为你推荐分类 <b>" + suggested + "</b>\n点击确认或选择其他分类："
+        if suggested else "📂 请选择商品分类："
+    )
     await message.answer(hint, parse_mode="HTML", reply_markup=category_keyboard(suggested))
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 步骤 2：分类选择（callback）
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# 步骤 2：分类选择
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.callback_query(F.data.startswith("cat:"), StateFilter(SubmitForm.item_category))
 async def step_category_selected(callback: CallbackQuery, state: FSMContext):
-
-    category = callback.data[4:]  # 去掉 "cat:" 前缀
+    category = callback.data[4:]
     await state.update_data(item_category=category)
     await state.set_state(SubmitForm.item_desc)
-
-    await callback.message.edit_text(
-        "✅ 已选择分类：<b>" + category + "</b>",
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text("✅ 已选择分类：<b>" + category + "</b>", parse_mode="HTML")
     await callback.message.answer(
         "第 3 步 / 共 8 步\n请输入<b>物品描述</b>\n"
         "💡 例：9成新，无划痕，原装配件齐全",
@@ -439,9 +570,9 @@ async def step_category_selected(callback: CallbackQuery, state: FSMContext):
     )
     await callback.answer()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # 步骤 3：物品描述
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(SubmitForm.item_desc)
 async def step_item_desc(message: Message, state: FSMContext):
@@ -450,14 +581,13 @@ async def step_item_desc(message: Message, state: FSMContext):
     await state.update_data(item_desc=(message.text or "").strip())
     await state.set_state(SubmitForm.item_price)
     await message.answer(
-        "第 4 步 / 共 8 步\n请输入<b>价格</b>（RM）\n"
-        "💡 例：350　或　面议",
+        "第 4 步 / 共 8 步\n请输入<b>价格</b>（RM）\n💡 例：350　或　面议",
         parse_mode="HTML"
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 步骤 4：价格输入 → 触发议价类型选择
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# 步骤 4：价格 → 弹出议价类型
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(SubmitForm.item_price)
 async def step_item_price(message: Message, state: FSMContext):
@@ -471,32 +601,26 @@ async def step_item_price(message: Message, state: FSMContext):
         reply_markup=price_type_keyboard()
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 步骤 5：议价类型（callback）
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# 步骤 5：议价类型
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.callback_query(F.data.startswith("pt:"), StateFilter(SubmitForm.item_price_type))
 async def step_price_type_selected(callback: CallbackQuery, state: FSMContext):
-
-    pt_key = callback.data[3:]  # 去掉 "pt:" 前缀
+    pt_key  = callback.data[3:]
     pt_label = PRICE_TYPES.get(pt_key, "")
     await state.update_data(item_price_type=pt_key)
     await state.set_state(SubmitForm.item_area)
-
-    await callback.message.edit_text(
-        "✅ 已选择：<b>" + pt_label + "</b>",
-        parse_mode="HTML"
-    )
+    await callback.message.edit_text("✅ 已选择：<b>" + pt_label + "</b>", parse_mode="HTML")
     await callback.message.answer(
-        "第 6 步 / 共 8 步\n请输入<b>所在地区</b>\n"
-        "💡 例：Subang Jaya, Selangor",
+        "第 6 步 / 共 8 步\n请输入<b>所在地区</b>\n💡 例：Subang Jaya, Selangor",
         parse_mode="HTML"
     )
     await callback.answer()
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # 步骤 6：地区
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(SubmitForm.item_area)
 async def step_item_area(message: Message, state: FSMContext):
@@ -505,14 +629,14 @@ async def step_item_area(message: Message, state: FSMContext):
     await state.update_data(item_area=(message.text or "").strip())
     await state.set_state(SubmitForm.contact)
     await message.answer(
-        "第 7 步（最后）/ 共 8 步\n请输入<b>联系方式</b>\n"
+        "第 7 步 / 共 8 步\n请输入<b>联系方式</b>\n"
         "💡 例：WA: 601XXXXXXXX 或 @telegram用户名",
         parse_mode="HTML"
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # 步骤 7：联系方式
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(SubmitForm.contact)
 async def step_contact(message: Message, state: FSMContext):
@@ -528,28 +652,26 @@ async def step_contact(message: Message, state: FSMContext):
         reply_markup=done_keyboard()
     )
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 上传媒体
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# 步骤 8：上传媒体
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(SubmitForm.media, F.photo)
 async def step_media_photo(message: Message, state: FSMContext):
-    data = await state.get_data()
+    data  = await state.get_data()
     media = data.get("media", [])
     if len(media) >= 10:
-        await message.answer("⚠️ 最多上传 10 个，请点击「✅ 提交投稿」。")
-        return
+        await message.answer("⚠️ 最多上传 10 个，请点击「✅ 提交投稿」。"); return
     media.append({"type": "photo", "file_id": message.photo[-1].file_id})
     await state.update_data(media=media)
     await message.answer("✅ 已收到第 " + str(len(media)) + " 个（图片），继续上传或点击「✅ 提交投稿」。")
 
 @router.message(SubmitForm.media, F.video)
 async def step_media_video(message: Message, state: FSMContext):
-    data = await state.get_data()
+    data  = await state.get_data()
     media = data.get("media", [])
     if len(media) >= 10:
-        await message.answer("⚠️ 最多上传 10 个，请点击「✅ 提交投稿」。")
-        return
+        await message.answer("⚠️ 最多上传 10 个，请点击「✅ 提交投稿」。"); return
     media.append({"type": "video", "file_id": message.video.file_id})
     await state.update_data(media=media)
     await message.answer("✅ 已收到第 " + str(len(media)) + " 个（视频），继续上传或点击「✅ 提交投稿」。")
@@ -564,22 +686,16 @@ async def btn_done(message: Message, state: FSMContext, bot: Bot):
 
 @router.message(SubmitForm.media, F.text)
 async def step_media_invalid(message: Message):
-    if is_cancel_trigger(message.text) or is_done_trigger(message.text):
-        return
-    await message.answer(
-        "⚠️ 请发送<b>图片或视频</b>，或点击「✅ 提交投稿」提交。",
-        parse_mode="HTML"
-    )
+    if is_cancel_trigger(message.text) or is_done_trigger(message.text): return
+    await message.answer("⚠️ 请发送<b>图片或视频</b>，或点击「✅ 提交投稿」提交。", parse_mode="HTML")
 
 async def _do_done(message: Message, state: FSMContext, bot: Bot):
-    data = await state.get_data()
+    data  = await state.get_data()
     media = data.get("media", [])
     if not media:
-        await message.answer("⚠️ 请至少上传 1 张图片或视频。")
-        return
+        await message.answer("⚠️ 请至少上传 1 张图片或视频。"); return
 
     await state.clear()
-
     user      = message.from_user
     user_id   = user.id
     username  = user.username or ""
@@ -587,59 +703,43 @@ async def _do_done(message: Message, state: FSMContext, bot: Bot):
 
     submission_id = make_submission_id(user_id)
     number = next_submission_number()
-    data["number"]    = number
-    data["user_id"]   = user_id
-    data["username"]  = username
-    data["full_name"] = full_name
+    data.update({"number": number, "user_id": user_id, "username": username, "full_name": full_name})
 
     pending_submissions[submission_id] = {
-        "user_id":   user_id,
-        "username":  username,
-        "full_name": full_name,
-        "data":      data,
-        "media":     media,
+        "user_id": user_id, "username": username,
+        "full_name": full_name, "data": data, "media": media,
     }
 
     caption = format_admin_text(data, user_id, media) + "\n\n🆔 <code>" + submission_id + "</code>"
-
     first = True
     for m in media:
+        kwargs = dict(caption=caption if first else None,
+                      parse_mode="HTML" if first else None,
+                      reply_markup=admin_review_keyboard(submission_id) if first else None)
         if m["type"] == "photo":
-            await bot.send_photo(
-                chat_id=ADMIN_ID, photo=m["file_id"],
-                caption=caption if first else None,
-                parse_mode="HTML" if first else None,
-                reply_markup=admin_review_keyboard(submission_id) if first else None
-            )
+            await bot.send_photo(chat_id=ADMIN_ID, photo=m["file_id"], **kwargs)
         else:
-            await bot.send_video(
-                chat_id=ADMIN_ID, video=m["file_id"],
-                caption=caption if first else None,
-                parse_mode="HTML" if first else None,
-                reply_markup=admin_review_keyboard(submission_id) if first else None
-            )
+            await bot.send_video(chat_id=ADMIN_ID, video=m["file_id"], **kwargs)
         first = False
 
     if len(media) > 1:
         await bot.send_message(
             chat_id=ADMIN_ID,
             text="⬆️ 以上是投稿 <b>#" + str(number) + "</b> 的全部媒体，请审核：",
-            parse_mode="HTML",
-            reply_markup=admin_review_keyboard(submission_id)
+            parse_mode="HTML", reply_markup=admin_review_keyboard(submission_id)
         )
 
     await message.answer(
         "🎉 投稿 <b>#" + str(number) + "</b> 已提交！\n"
         "管理员审核后会通知你结果，请耐心等待。\n\n"
         "💡 审核通过后，如商品已售出，发送 <code>/sold " + str(number) + "</code> 标记已售。",
-        parse_mode="HTML",
-        reply_markup=main_keyboard()
+        parse_mode="HTML", reply_markup=main_keyboard()
     )
-    logger.info("New submission #%s (%s) from user %s, media: %s", number, submission_id, user_id, len(media))
+    logger.info("New submission #%s from user %s", number, user_id)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # 审核通过
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.callback_query(F.data.startswith("approve:"))
 async def admin_approve(callback: CallbackQuery, bot: Bot):
@@ -647,7 +747,7 @@ async def admin_approve(callback: CallbackQuery, bot: Bot):
         await callback.answer("⛔ 你没有权限操作。", show_alert=True); return
 
     submission_id = callback.data.split(":", 1)[1]
-    submission = pending_submissions.get(submission_id)
+    submission    = pending_submissions.get(submission_id)
     if not submission:
         await callback.answer("⚠️ 该投稿已处理或已过期。", show_alert=True); return
 
@@ -658,23 +758,19 @@ async def admin_approve(callback: CallbackQuery, bot: Bot):
     full_name = submission["full_name"]
     number    = data.get("number", "????")
 
-    channel_text = format_channel_text(data, user_id, username, full_name)
-
     try:
         post_msg_id, btn_msg_id = await post_to_channel_with_buttons(
-            bot, media, channel_text, number, data["item_name"]
+            bot, media, format_channel_text(data, user_id, username, full_name),
+            number, data["item_name"]
         )
     except Exception as e:
-        logger.error("Failed to post to channel: %s", e)
+        logger.error("Failed to post: %s", e)
         await callback.answer("❌ 发布到频道失败，请检查机器人权限。", show_alert=True); return
 
-    # 记录已售信息（用于 /sold 命令）
-    sold_posts[number] = {
-        "btn_msg_id": btn_msg_id,
-        "user_id":    user_id,
-    }
+    # 持久化已售记录
+    sold_posts[number] = {"btn_msg_id": btn_msg_id, "user_id": user_id}
+    db_add_sold(number, btn_msg_id, user_id)
 
-    # 通知群组
     try:
         await bot.send_message(
             chat_id=GROUP_ID,
@@ -684,13 +780,11 @@ async def admin_approve(callback: CallbackQuery, bot: Bot):
                 "💰 RM " + data["item_price"] + " | 📍 " + data["item_area"] + "\n\n"
                 "👇 点击下方按钮查看详情"
             ),
-            parse_mode="HTML",
-            reply_markup=group_notify_keyboard(post_msg_id)
+            parse_mode="HTML", reply_markup=group_notify_keyboard(post_msg_id)
         )
     except Exception as e:
         logger.warning("Failed to notify group: %s", e)
 
-    # 通知投稿人
     try:
         await bot.send_message(
             chat_id=user_id,
@@ -698,24 +792,21 @@ async def admin_approve(callback: CallbackQuery, bot: Bot):
                 "🎉 <b>你的投稿 #" + str(number) + " 已通过审核并发布！</b>\n\n"
                 "商品已售出后，发送 <code>/sold " + str(number) + "</code> 标记已售出。"
             ),
-            parse_mode="HTML",
-            reply_markup=main_keyboard()
+            parse_mode="HTML", reply_markup=main_keyboard()
         )
     except Exception:
         logger.warning("Cannot notify user %s", user_id)
 
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(
-        "✅ 投稿 <b>#" + str(number) + "</b> 已通过并发布到频道。",
-        parse_mode="HTML"
+        "✅ 投稿 <b>#" + str(number) + "</b> 已通过并发布到频道。", parse_mode="HTML"
     )
     await callback.answer("✅ 已通过并发布！")
     pending_submissions.pop(submission_id, None)
-    logger.info("Submission #%s approved", number)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # 审核不通过
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.callback_query(F.data.startswith("reject:"))
 async def admin_reject_start(callback: CallbackQuery, state: FSMContext):
@@ -723,7 +814,7 @@ async def admin_reject_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("⛔ 你没有权限操作。", show_alert=True); return
 
     submission_id = callback.data.split(":", 1)[1]
-    submission = pending_submissions.get(submission_id)
+    submission    = pending_submissions.get(submission_id)
     if not submission:
         await callback.answer("⚠️ 该投稿已处理或已过期。", show_alert=True); return
 
@@ -743,8 +834,9 @@ async def admin_reject_text(message: Message, state: FSMContext, bot: Bot):
 
 @router.message(RejectReason.waiting_reason, F.from_user.id == ADMIN_ID, F.photo)
 async def admin_reject_photo(message: Message, state: FSMContext, bot: Bot):
-    reason_text = (message.caption or "（管理员附上了图片说明）").strip()
-    await _send_reject(message, state, bot, reason_text=reason_text, photo_id=message.photo[-1].file_id)
+    await _send_reject(message, state, bot,
+                       reason_text=(message.caption or "（管理员附上了图片说明）").strip(),
+                       photo_id=message.photo[-1].file_id)
 
 async def _send_reject(message: Message, state: FSMContext, bot: Bot, reason_text, photo_id):
     submission_id = reject_context.get(ADMIN_ID)
@@ -759,91 +851,71 @@ async def _send_reject(message: Message, state: FSMContext, bot: Bot, reason_tex
     user_id = submission["user_id"]
     number  = submission["data"].get("number", "????")
     item    = submission["data"].get("item_name", "")
-
     reject_msg = (
         "❌ <b>你的投稿 #" + str(number) + " 未通过审核</b>\n\n"
         "📦 物品：" + item + "\n\n"
         "💬 <b>原因：</b>" + reason_text + "\n\n"
         "请修改后重新点击「📦 开始投稿」重新投稿。"
     )
-
     try:
         if photo_id:
-            await bot.send_photo(
-                chat_id=user_id, photo=photo_id,
-                caption=reject_msg, parse_mode="HTML",
-                reply_markup=main_keyboard()
-            )
+            await bot.send_photo(chat_id=user_id, photo=photo_id,
+                                 caption=reject_msg, parse_mode="HTML",
+                                 reply_markup=main_keyboard())
         else:
-            await bot.send_message(
-                chat_id=user_id, text=reject_msg,
-                parse_mode="HTML", reply_markup=main_keyboard()
-            )
+            await bot.send_message(chat_id=user_id, text=reject_msg,
+                                   parse_mode="HTML", reply_markup=main_keyboard())
     except Exception:
         logger.warning("Cannot notify user %s", user_id)
 
     await message.answer(
-        "✅ 已将拒绝原因发送给用户，投稿 <b>#" + str(number) + "</b> 已移除。",
-        parse_mode="HTML"
+        "✅ 已将拒绝原因发送给用户，投稿 <b>#" + str(number) + "</b> 已移除。", parse_mode="HTML"
     )
     pending_submissions.pop(submission_id, None)
     reject_context.pop(ADMIN_ID, None)
     await state.clear()
-    logger.info("Submission #%s rejected. Reason: %s", number, reason_text)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# ⑤ 自助标记已售出 /sold <编号>
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+# /sold 自助标记已售出
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(Command("sold"))
 async def cmd_sold(message: Message, bot: Bot):
     args = message.text.split()[1:] if message.text else []
     if not args or not args[0].isdigit():
         await message.answer(
-            "❓ 用法：<code>/sold 编号</code>\n"
-            "💡 例：<code>/sold 1009528</code>",
+            "❓ 用法：<code>/sold 编号</code>\n💡 例：<code>/sold 1009528</code>",
             parse_mode="HTML"
-        )
-        return
+        ); return
 
-    number = int(args[0])
+    number    = int(args[0])
     post_info = sold_posts.get(number)
-
     if not post_info:
         await message.answer(
-            "⚠️ 未找到编号 #" + str(number) + " 的记录。\n"
-            "请确认编号正确，或者机器人重启后记录已丢失。"
-        )
-        return
+            "⚠️ 未找到编号 #" + str(number) + " 的记录。\n请确认编号正确。"
+        ); return
 
-    # 只允许原投稿人或管理员操作
     if message.from_user.id != post_info["user_id"] and message.from_user.id != ADMIN_ID:
-        await message.answer("⛔ 只有原投稿人才能标记自己的商品已售出。")
-        return
-
-    btn_msg_id = post_info["btn_msg_id"]
+        await message.answer("⛔ 只有原投稿人才能标记自己的商品已售出。"); return
 
     try:
         await bot.edit_message_reply_markup(
-            chat_id=CHANNEL_ID,
-            message_id=btn_msg_id,
-            reply_markup=channel_keyboard(btn_msg_id, sold=True)
+            chat_id=CHANNEL_ID, message_id=post_info["btn_msg_id"],
+            reply_markup=channel_keyboard(post_info["btn_msg_id"], sold=True)
         )
         sold_posts.pop(number, None)
+        db_delete_sold(number)
         await message.answer(
-            "✅ <b>#" + str(number) + " 已标记为售出！</b>\n"
-            "频道帖子已更新，感谢使用～",
-            parse_mode="HTML",
-            reply_markup=main_keyboard()
+            "✅ <b>#" + str(number) + " 已标记为售出！</b>\n频道帖子已更新，感谢使用～",
+            parse_mode="HTML", reply_markup=main_keyboard()
         )
-        logger.info("Submission #%s marked as sold by user %s", number, message.from_user.id)
+        logger.info("Submission #%s marked as sold", number)
     except Exception as e:
         await message.answer("❌ 操作失败：" + str(e))
-        logger.error("Failed to mark #%s as sold: %s", number, e)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # 点赞 / 点踩
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.callback_query(F.data.startswith("vote:"))
 async def handle_vote(callback: CallbackQuery, bot: Bot):
@@ -861,6 +933,8 @@ async def handle_vote(callback: CallbackQuery, bot: Bot):
 
     vote_users[btn_msg_id].add(user_id)
     vote_data[btn_msg_id][vote_type] += 1
+    db_save_vote(btn_msg_id, vote_data[btn_msg_id]["up"], vote_data[btn_msg_id]["down"])
+    db_add_vote_user(btn_msg_id, user_id)
 
     try:
         await bot.edit_message_reply_markup(
@@ -870,16 +944,15 @@ async def handle_vote(callback: CallbackQuery, bot: Bot):
     except Exception as e:
         logger.warning("Vote update failed: %s", e)
 
-    emoji = "👍" if vote_type == "up" else "👎"
-    await callback.answer(emoji + " 已记录！")
+    await callback.answer(("👍" if vote_type == "up" else "👎") + " 已记录！")
 
 @router.callback_query(F.data == "sold_notice")
 async def sold_notice(callback: CallbackQuery):
     await callback.answer("此商品已售出，感谢关注！", show_alert=True)
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # 广告管理
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 @router.message(F.from_user.id == ADMIN_ID, F.text.func(is_addad_trigger))
 async def cmd_addad(message: Message, state: FSMContext):
@@ -887,7 +960,7 @@ async def cmd_addad(message: Message, state: FSMContext):
     await message.answer(
         "📢 请按以下格式发送广告信息：\n\n"
         "<code>广告文字 | 链接 | 小时数</code>\n\n"
-        "💡 例：\n<code>🔥 点击领取优惠券 | https://example.com | 24</code>\n\n"
+        "💡 例：<code>🔥 点击领取优惠券 | https://example.com | 24</code>\n\n"
         "小时数填 <b>0</b> 表示永久，发送「取消」退出。",
         parse_mode="HTML"
     )
@@ -911,30 +984,27 @@ async def addad_input(message: Message, state: FSMContext):
 
     expire = None if hours == 0 else time.time() + hours * 3600
     ads.append({"text": ad_text, "url": ad_url, "expire": expire})
+    db_add_ad(ad_text, ad_url, expire)
     await state.clear()
 
     expire_info = "永久" if expire is None else str(int(hours)) + " 小时后过期"
     await message.answer(
         "✅ 广告已添加！\n\n"
-        "📌 文字：" + ad_text + "\n"
-        "🔗 链接：" + ad_url + "\n"
-        "⏰ 有效期：" + expire_info + "\n\n"
+        "📌 文字：" + ad_text + "\n🔗 链接：" + ad_url + "\n⏰ 有效期：" + expire_info + "\n\n"
         "当前共 " + str(len(ads)) + " 条广告。"
     )
-    logger.info("Ad added: %s | %s | expire=%s", ad_text, ad_url, expire)
 
 @router.message(F.from_user.id == ADMIN_ID, F.text.func(is_listad_trigger))
 async def cmd_listad(message: Message):
     if not ads:
         await message.answer("📭 目前没有广告。"); return
-    now = time.time()
+    now   = time.time()
     lines = []
     for i, ad in enumerate(ads, 1):
         if ad["expire"] is None:
             status = "♾️ 永久"
         elif ad["expire"] > now:
-            remain = int((ad["expire"] - now) / 3600)
-            status = "⏰ 剩余约 " + str(remain) + " 小时"
+            status = "⏰ 剩余约 " + str(int((ad["expire"] - now) / 3600)) + " 小时"
         else:
             status = "❌ 已过期"
         lines.append(str(i) + ". " + ad["text"] + "\n   🔗 " + ad["url"] + "\n   " + status)
@@ -942,9 +1012,9 @@ async def cmd_listad(message: Message):
 
 @router.message(F.from_user.id == ADMIN_ID, F.text.func(is_delad_trigger))
 async def cmd_delad(message: Message):
-    now     = time.time()
-    expired = [ad for ad in ads if ad["expire"] is not None and ad["expire"] <= now]
-    for ad in expired:
+    # 先清理过期
+    cleaned = db_clean_expired_ads()
+    for ad in [a for a in ads if a["expire"] is not None and a["expire"] <= time.time()]:
         ads.remove(ad)
 
     text  = (message.text or "").strip()
@@ -953,32 +1023,27 @@ async def cmd_delad(message: Message):
         idx = int(parts[1]) - 1
         if 0 <= idx < len(ads):
             removed = ads.pop(idx)
+            db_delete_ad_by_index(idx)
             await message.answer("✅ 已删除广告：" + removed["text"] + "\n当前剩余 " + str(len(ads)) + " 条。")
         else:
-            await message.answer("⚠️ 编号不存在，当前共 " + str(len(ads)) + " 条，用「看广告」查看列表。")
+            await message.answer("⚠️ 编号不存在，当前共 " + str(len(ads)) + " 条。")
         return
 
-    cleaned = len(expired)
     if cleaned > 0:
-        await message.answer(
-            "✅ 已清理 " + str(cleaned) + " 条过期广告，剩余 " + str(len(ads)) + " 条。\n\n"
-            "💡 删除指定广告：「删广告 编号」，例如「删广告 2」"
-        )
+        await message.answer("✅ 已清理 " + str(cleaned) + " 条过期广告，剩余 " + str(len(ads)) + " 条。")
     else:
-        await message.answer(
-            "ℹ️ 没有过期广告，当前共 " + str(len(ads)) + " 条。\n\n"
-            "💡 删除指定广告：「删广告 编号」，例如「删广告 2」"
-        )
+        await message.answer("ℹ️ 没有过期广告，当前共 " + str(len(ads)) + " 条。\n\n💡 删除指定广告：「删广告 编号」")
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 # 主入口
-# ─────────────────────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
 
 async def main():
     bot = Bot(token=BOT_TOKEN)
     dp  = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    logger.info("Bot starting...")
+    logger.info("Bot starting... counter=%s, ads=%s, sold=%s",
+                submission_counter, len(ads), len(sold_posts))
     await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 if __name__ == "__main__":
