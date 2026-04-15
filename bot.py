@@ -87,32 +87,35 @@ def db_save_counter(value):
 # ── 广告 ──────────────────────────────────────────────────────────────────────
 def db_load_ads():
     conn = get_db()
-    rows = conn.execute("SELECT text, url, expire FROM ads ORDER BY id").fetchall()
+    rows = conn.execute("SELECT id, text, url, expire FROM ads ORDER BY id").fetchall()
     conn.close()
-    return [{"text": r["text"], "url": r["url"], "expire": r["expire"]} for r in rows]
+    return [{"id": r["id"], "text": r["text"], "url": r["url"], "expire": r["expire"]} for r in rows]
 
 def db_add_ad(text, url, expire):
     conn = get_db()
-    conn.execute("INSERT INTO ads (text, url, expire) VALUES (?, ?, ?)", (text, url, expire))
+    cursor = conn.execute("INSERT INTO ads (text, url, expire) VALUES (?, ?, ?)", (text, url, expire))
     conn.commit()
+    new_id = cursor.lastrowid
     conn.close()
+    return new_id
 
-def db_delete_ad_by_index(idx):
+def db_delete_ad_by_id(ad_id):
     conn = get_db()
-    rows = conn.execute("SELECT id FROM ads ORDER BY id").fetchall()
-    if 0 <= idx < len(rows):
-        conn.execute("DELETE FROM ads WHERE id=?", (rows[idx]["id"],))
-        conn.commit()
+    conn.execute("DELETE FROM ads WHERE id=?", (ad_id,))
+    conn.commit()
     conn.close()
 
 def db_clean_expired_ads():
     conn = get_db()
-    deleted = conn.execute(
-        "DELETE FROM ads WHERE expire IS NOT NULL AND expire <= ?", (time.time(),)
-    ).rowcount
-    conn.commit()
+    rows = conn.execute(
+        "SELECT id FROM ads WHERE expire IS NOT NULL AND expire <= ?", (time.time(),)
+    ).fetchall()
+    expired_ids = {r["id"] for r in rows}
+    if expired_ids:
+        conn.execute("DELETE FROM ads WHERE expire IS NOT NULL AND expire <= ?", (time.time(),))
+        conn.commit()
     conn.close()
-    return deleted
+    return expired_ids
 
 # ── 已售出 ────────────────────────────────────────────────────────────────────
 def db_load_sold():
@@ -983,8 +986,8 @@ async def addad_input(message: Message, state: FSMContext):
         await message.answer("⚠️ 小时数必须是数字，例如 24 或 0。"); return
 
     expire = None if hours == 0 else time.time() + hours * 3600
-    ads.append({"text": ad_text, "url": ad_url, "expire": expire})
-    db_add_ad(ad_text, ad_url, expire)
+    new_id = db_add_ad(ad_text, ad_url, expire)
+    ads.append({"id": new_id, "text": ad_text, "url": ad_url, "expire": expire})
     await state.clear()
 
     expire_info = "永久" if expire is None else str(int(hours)) + " 小时后过期"
@@ -1013,9 +1016,10 @@ async def cmd_listad(message: Message):
 @router.message(F.from_user.id == ADMIN_ID, F.text.func(is_delad_trigger))
 async def cmd_delad(message: Message):
     # 先清理过期
-    cleaned = db_clean_expired_ads()
-    for ad in [a for a in ads if a["expire"] is not None and a["expire"] <= time.time()]:
-        ads.remove(ad)
+    expired_ids = db_clean_expired_ads()
+    if expired_ids:
+        for ad in [a for a in ads if a.get("id") in expired_ids]:
+            ads.remove(ad)
 
     text  = (message.text or "").strip()
     parts = text.split(maxsplit=1)
@@ -1023,14 +1027,14 @@ async def cmd_delad(message: Message):
         idx = int(parts[1]) - 1
         if 0 <= idx < len(ads):
             removed = ads.pop(idx)
-            db_delete_ad_by_index(idx)
+            db_delete_ad_by_id(removed["id"])
             await message.answer("✅ 已删除广告：" + removed["text"] + "\n当前剩余 " + str(len(ads)) + " 条。")
         else:
             await message.answer("⚠️ 编号不存在，当前共 " + str(len(ads)) + " 条。")
         return
 
-    if cleaned > 0:
-        await message.answer("✅ 已清理 " + str(cleaned) + " 条过期广告，剩余 " + str(len(ads)) + " 条。")
+    if expired_ids:
+        await message.answer("✅ 已清理 " + str(len(expired_ids)) + " 条过期广告，剩余 " + str(len(ads)) + " 条。")
     else:
         await message.answer("ℹ️ 没有过期广告，当前共 " + str(len(ads)) + " 条。\n\n💡 删除指定广告：「删广告 编号」")
 
